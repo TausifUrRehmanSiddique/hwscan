@@ -1,0 +1,166 @@
+name: Build bootable image
+
+# Two triggers:
+#   * push a tag (v1.0.0, v1.0.1, ...) -> builds and publishes a GitHub Release
+#   * "Run workflow" button            -> builds and attaches an artifact
+#
+# Nothing runs on ordinary pushes to main: a 1 GB image per commit is a waste
+# of everyone's storage quota. The scanner still gets compiled and tested on
+# every push by the `check` job below, which is the part that catches breakage.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      size_mb:
+        description: "Image size in MB"
+        required: false
+        default: "1024"
+      part_type:
+        description: "MBR partition type: 0c = visible in Windows, ef = strict UEFI firmware"
+        required: false
+        default: "0c"
+        type: choice
+        options: ["0c", "ef"]
+
+permissions:
+  contents: read
+
+jobs:
+  # -------------------------------------------------------------------------
+  # Fast feedback. Runs in under a minute and does not need Docker or root.
+  # -------------------------------------------------------------------------
+  check:
+    name: Compile and test scanner
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Build (warnings are errors here, unlike the release build)
+        run: make CXXFLAGS="-std=c++17 -O2 -Wall -Wextra -Wno-unused-parameter -Werror"
+
+      - name: Build static binary
+        run: make static
+
+      - name: Run against the synthetic machine
+        run: |
+          make clean
+          make test
+          # `make test` swallows hwscan's exit code so a WARN result does not
+          # fail the build. Assert on the output instead.
+          test -s /tmp/hwscan-out/inventory.csv || { echo "no CSV produced"; exit 1; }
+          COLS=$(head -1 /tmp/hwscan-out/inventory.csv | tr ',' '\n' | wc -l)
+          echo "columns: $COLS"
+          [ "$COLS" -eq 42 ] || { echo "expected 42 columns, got $COLS"; exit 1; }
+
+      - name: Shell syntax
+        run: |
+          bash -n iso/build-iso.sh
+          # Validate the embedded init under dash, the closest proxy for the
+          # busybox ash that will actually run it.
+          sed -n "/^cat > \"\${ROOT}\/init\" <<'INITEOF'\$/,/^INITEOF\$/p" \
+            iso/build-iso.sh | sed '1d;$d' > /tmp/init.sh
+          dash -n /tmp/init.sh
+
+  # -------------------------------------------------------------------------
+  # The image build. Needs root and loop devices, both of which a GitHub-hosted
+  # runner provides -- it is a full VM, not a container.
+  # -------------------------------------------------------------------------
+  image:
+    name: Build .img
+    needs: check
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: write        # only used by the release step on tag builds
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0     # so `git describe` sees tags
+
+      - name: Derive a traceable name
+        id: meta
+        run: |
+          SHA="$(git rev-parse --short HEAD)"
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            NAME="hwscan-${GITHUB_REF_NAME}"
+          else
+            NAME="hwscan-$(date -u +%Y%m%d)-${SHA}"
+          fi
+          echo "name=${NAME}"   >> "$GITHUB_OUTPUT"
+          echo "Building ${NAME} from ${GITHUB_SHA}"
+
+      - name: Free up disk space
+        run: |
+          # A 1 GB image, ~400 MB of Debian packages and a kernel tree fit
+          # comfortably, but the runner ships with a lot of preinstalled SDKs.
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost || true
+          df -h /
+
+      - name: Build image
+        env:
+          HWSCAN_NAME:      ${{ steps.meta.outputs.name }}
+          HWSCAN_COMMIT:    ${{ github.sha }}
+          HWSCAN_IMG_MB:    ${{ github.event.inputs.size_mb || '1024' }}
+          HWSCAN_PART_TYPE: ${{ github.event.inputs.part_type || '0c' }}
+        run: |
+          chmod +x iso/build-iso.sh
+          # -E so the HWSCAN_* variables survive into the root shell.
+          sudo -E ./iso/build-iso.sh --docker
+
+      - name: Take ownership of root-created files
+        run: sudo chown -R "$(id -u):$(id -g)" dist build
+
+      - name: Show what GRUB did
+        if: always()
+        run: |
+          for f in build/grub-bios.log build/grub-uefi.log; do
+            [ -f "$f" ] && { echo "===== $f ====="; cat "$f"; }
+          done
+          echo "===== provenance ====="
+          cat build/buildinfo.txt || true
+
+      - name: Compress
+        run: |
+          cd dist
+          ls -lh
+          # The image is 1 GB but almost entirely empty FAT32, so it compresses
+          # to well under a tenth of that. The .sha256 written by the build
+          # covers the UNCOMPRESSED image -- verify after decompressing.
+          zstd -19 -T0 --rm -f *.img
+          sha256sum ./* > SHA256SUMS
+          echo "===== SHA256SUMS ====="; cat SHA256SUMS
+          ls -lh
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: ${{ steps.meta.outputs.name }}
+          path: dist/*
+          retention-days: 14
+          if-no-files-found: error
+
+      - name: Publish release
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" dist/* \
+            --title "${GITHUB_REF_NAME}" \
+            --generate-notes \
+            --notes-file - <<EOF
+          Bootable hardware inventory image, built from \`${GITHUB_SHA}\`.
+
+          **Decompress, verify, then write:**
+          \`\`\`bash
+          zstd -d ${{ steps.meta.outputs.name }}.img.zst
+          sha256sum -c ${{ steps.meta.outputs.name }}.img.sha256
+          lsblk -d -o NAME,PATH,SIZE,TRAN,MODEL   # confirm the device FIRST
+          sudo dd if=${{ steps.meta.outputs.name }}.img of=/dev/sdX bs=4M status=progress conv=fsync
+          \`\`\`
+
+          Secure Boot must be disabled on the machines being scanned; this image is unsigned.
+          EOF

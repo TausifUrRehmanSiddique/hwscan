@@ -1,0 +1,7 @@
+# .gitattributes -- shell scripts must stay LF or the initramfs breaks
+*.sh text eol=lf
+iso/build-iso.sh text eol=lf
+*.c text eol=lf
+*.cpp text eol=lf
+*.h text eol=lf
+Makefile text eol=lf

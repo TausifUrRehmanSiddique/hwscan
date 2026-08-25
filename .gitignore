@@ -1,0 +1,11 @@
+# Build products. None of these belong in git -- git keeps every version of a
+# binary forever, and a 1 GB .img would bloat the repo permanently. Publish
+# images as CI artifacts or release assets instead.
+*.o
+hwscan
+build/
+dist/
+*.img
+*.img.zst
+*.iso
+*.sha256
